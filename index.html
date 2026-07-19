@@ -803,7 +803,7 @@
             else el.classList.add('d-none');
         }
 
-        const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwtcOKnAF6hNZLPl4xuAk4BDqc7D8saB4NbPRwxpQW0_a_2mXG4sIKuW07ZPJEBgi4i/exec'; // Ganti dengan URL Web App hasil deploy terbaru
+       const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwtcOKnAF6hNZLPl4xuAk4BDqc7D8saB4NbPRwxpQW0_a_2mXG4sIKuW07ZPJEBgi4i/exec'; // Pastikan ini URL Web App terbaru yang aktif
 
         function gasRun(funcName) {
             var args = Array.prototype.slice.call(arguments, 1);
@@ -812,16 +812,25 @@
                     var runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
                     runner[funcName].apply(runner, args);
                 } else {
-                    if (SCRIPT_URL === 'https://script.google.com/macros/s/AKfycbwtcOKnAF6hNZLPl4xuAk4BDqc7D8saB4NbPRwxpQW0_a_2mXG4sIKuW07ZPJEBgi4i/exec') {
-                        reject(new Error("URL Web App belum disetel. Isi SCRIPT_URL di Index.html."));
+                    if (!SCRIPT_URL.startsWith('http')) {
+                        reject(new Error("URL Web App salah atau belum disetel."));
                         return;
                     }
                     fetch(SCRIPT_URL, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
                         body: JSON.stringify({ funcName: funcName, args: args })
                     })
-                    .then(function(response) { return response.json(); })
+                    .then(function(response) {
+                        if (!response.ok) throw new Error("Gagal menghubungi server GAS.");
+                        return response.text();
+                    })
+                    .then(function(text) {
+                        try {
+                            return JSON.parse(text);
+                        } catch(e) {
+                            throw new Error("Penting: Web App GAS harus di-deploy dengan pengaturan Who has access: 'Anyone'.");
+                        }
+                    })
                     .then(resolve)
                     .catch(reject);
                 }
@@ -921,7 +930,7 @@
                 }
             }).catch(function(err) {
                 showFullPageLoading(false);
-                Swal.fire('Error', 'Terjadi kesalahan sistem', 'error');
+                Swal.fire('Error', (err && err.message) ? err.message : 'Terjadi kesalahan sistem', 'error');
             });
         };
 
