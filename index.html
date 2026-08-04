@@ -585,6 +585,7 @@
                             <thead class="table-light">
                                 <tr>
                                     <th>Tanggal Kejadian</th>
+                                    <th>Tanggal Panggilan Ortu</th>
                                     <th>Siswa</th>
                                     <th>Kelas</th>
                                     <th>Pelanggaran</th>
@@ -792,6 +793,16 @@
         var currentDataPelanggaran = []; // cache for filtering
         var currentSiswaCache = [];
         var dashboardBerulangDetail = [];
+        var currentOrtuStatus = 'Belum Dipanggil';
+        var clientCache = {};
+        var pendingRequests = {};
+        var cacheVersion = 0;
+        var cacheWarmStarted = false;
+        var CACHE_TTL = {
+            short: 60000,
+            medium: 120000,
+            reference: 600000
+        };
 
         // ==================== AUTH MODULE (ENHANCED) ====================
         var Auth = (function() {
@@ -836,7 +847,63 @@
             else el.classList.add('d-none');
         }
 
-       const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxVf-vHHvH-Kd4cruhablGsu3nzzQ6q3iH5JI5ebhCewR-RQeTgJ1ZlW2xMGNKt-3Cs/exec'; // Pastikan ini URL Web App terbaru yang aktif
+        function hasFreshClientCache(key) {
+            var item = clientCache[key];
+            return !!item && item.expiresAt > Date.now();
+        }
+
+        function putClientCache(key, value, ttlMs) {
+            clientCache[key] = { value: value, expiresAt: Date.now() + ttlMs };
+        }
+
+        function invalidateClientCache(prefixes) {
+            if (prefixes && prefixes.length) cacheVersion++;
+            (prefixes || []).forEach(function(prefix) {
+                Object.keys(clientCache).forEach(function(key) {
+                    if (key === prefix || key.indexOf(prefix) === 0) delete clientCache[key];
+                });
+            });
+        }
+
+        function cachedGasRun(cacheKey, ttlMs, funcName) {
+            var args = Array.prototype.slice.call(arguments, 3);
+            var requestToken = Auth.getToken();
+            var requestVersion = cacheVersion;
+            var pendingKey = cacheKey + '@' + requestVersion;
+            if (hasFreshClientCache(cacheKey)) {
+                return Promise.resolve(clientCache[cacheKey].value);
+            }
+            if (pendingRequests[pendingKey]) return pendingRequests[pendingKey];
+
+            var callArgs = [funcName].concat(args);
+            pendingRequests[pendingKey] = gasRun.apply(null, callArgs).then(function(res) {
+                if (res && res.success && Auth.getToken() === requestToken && cacheVersion === requestVersion) putClientCache(cacheKey, res, ttlMs);
+                delete pendingRequests[pendingKey];
+                return res;
+            }).catch(function(err) {
+                delete pendingRequests[pendingKey];
+                throw err;
+            });
+            return pendingRequests[pendingKey];
+        }
+
+        function warmCommonCaches() {
+            if (cacheWarmStarted || !Auth.isVerified()) return;
+            cacheWarmStarted = true;
+            var warm = function() {
+                var token = Auth.getToken();
+                cachedGasRun('all-pelanggaran', CACHE_TTL.short, 'getAllDataPelanggaran', token).catch(function(){});
+                cachedGasRun('input-options', CACHE_TTL.reference, 'getOptionsInput', token).catch(function(){});
+                cachedGasRun('all-siswa', CACHE_TTL.reference, 'getAllSiswaList', token).catch(function(){});
+            };
+            if ('requestIdleCallback' in window) {
+                window.requestIdleCallback(warm, { timeout: 1500 });
+            } else {
+                setTimeout(warm, 500);
+            }
+        }
+
+       const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyXOUU3at43DH_-4cbILD-lNitlYNoDcVyqeET3sx6SLlwp-G-D9MCp-V6YWt5zVcE/exec'; // Pastikan ini URL Web App terbaru yang aktif
 
         function gasRun(funcName) {
             var args = Array.prototype.slice.call(arguments, 1);
@@ -888,6 +955,7 @@
                 mainApp.classList.remove('d-none');
                 document.getElementById('displayUserName').innerText = Auth.getUser().name;
                 showPage(activePage || 'dashboard');
+                warmCommonCaches();
             } else {
                 mainApp.classList.add('d-none');
                 loginPage.classList.remove('d-none');
@@ -973,6 +1041,10 @@
                 gasRun('destroySession', token).catch(function(e){});
             }
             Auth.clear();
+            clientCache = {};
+            pendingRequests = {};
+            cacheVersion++;
+            cacheWarmStarted = false;
             document.getElementById('loginForm').reset();
             checkLoginState();
         };
@@ -980,10 +1052,11 @@
         // ==================== DASHBOARD ====================
         function fetchDashboard() {
             var requestedPage = 'dashboard';
-            showSectionLoading(true);
-            gasRun('getDashboardData', Auth.getToken()).then(function(res) {
-                if(activePage !== requestedPage) return;
+            var cacheKey = 'dashboard';
+            if (!hasFreshClientCache(cacheKey)) showSectionLoading(true);
+            cachedGasRun(cacheKey, CACHE_TTL.medium, 'getDashboardData', Auth.getToken()).then(function(res) {
                 showSectionLoading(false);
+                if(activePage !== requestedPage) return;
                 if(handleSessionExpired(res)) return;
                 if(res.success) renderDashboard(res.data);
                 else Swal.fire('Error', res.message || 'Gagal memuat dashboard', 'error');
@@ -1099,7 +1172,7 @@
             autoFillSiswaData('');
             document.getElementById('inpTanggal').value = new Date().toISOString().split('T')[0];
 
-            gasRun('getOptionsInput', Auth.getToken()).then(function(res) {
+            cachedGasRun('input-options', CACHE_TTL.reference, 'getOptionsInput', Auth.getToken()).then(function(res) {
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
                     var kHtml = '<option value="">-- Pilih Kelas --</option>';
@@ -1121,7 +1194,7 @@
                 selSiswa.disabled = true;
                 return;
             }
-            gasRun('getSiswaByKelas', Auth.getToken(), kelasId).then(function(res) {
+            cachedGasRun('siswa-kelas:' + kelasId, CACHE_TTL.reference, 'getSiswaByKelas', Auth.getToken(), kelasId).then(function(res) {
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
                     currentSiswaCache = res.data;
@@ -1156,7 +1229,7 @@
                 selJenis.disabled = true;
                 return;
             }
-            gasRun('getJenisByKategori', Auth.getToken(), katId).then(function(res) {
+            cachedGasRun('jenis-kategori:' + katId, CACHE_TTL.reference, 'getJenisByKategori', Auth.getToken(), katId).then(function(res) {
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
                     var html = '<option value="">-- Pilih Jenis --</option>';
@@ -1244,6 +1317,7 @@
                 showFullPageLoading(false);
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
+                    invalidateClientCache(['dashboard', 'all-pelanggaran', 'ortu:', 'terlambat:', 'riwayat:']);
                     document.getElementById('formInputPelanggaran').reset();
                     showPage('data');
                     Swal.fire({
@@ -1269,11 +1343,12 @@
         }
 
         function fetchAllData() {
-            showSectionLoading(true);
+            var cacheKey = 'all-pelanggaran';
+            if (!hasFreshClientCache(cacheKey)) showSectionLoading(true);
             var req = 'data';
-            gasRun('getAllDataPelanggaran', Auth.getToken()).then(function(res) {
-                if(activePage !== req) return;
+            cachedGasRun(cacheKey, CACHE_TTL.short, 'getAllDataPelanggaran', Auth.getToken()).then(function(res) {
                 showSectionLoading(false);
+                if(activePage !== req) return;
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
                     currentDataPelanggaran = res.data || [];
@@ -1320,8 +1395,17 @@
 
             var rows = filtered.map(function(p) {
                 var badgeOrtu = p.status_ortu === 'Belum Dipanggil' ? 'bg-danger' : 'bg-success';
-                var badgeTindak = p.status_tindak === 'Selesai' ? 'bg-success' : (p.status_tindak === 'Dalam Proses' ? 'bg-warning' : 'bg-secondary');
                 var jenText = p.lainnya ? p.lainnya : p.jenis;
+                var statusValues = ['Belum Ditindaklanjuti', 'Dalam Proses', 'Selesai'];
+                var currentStatus = statusValues.indexOf(p.status_tindak) >= 0 ? p.status_tindak : 'Belum Ditindaklanjuti';
+                var statusLabels = {
+                    'Belum Ditindaklanjuti': 'Belum Ditindak Lanjuti',
+                    'Dalam Proses': 'Dalam Proses',
+                    'Selesai': 'Selesai'
+                };
+                var statusOptions = statusValues.map(function(status) {
+                    return `<option value="${status}" ${status === currentStatus ? 'selected' : ''}>${statusLabels[status]}</option>`;
+                }).join('');
                 var buktiLinks = String(p.bukti_foto || '').split(/\n+/).filter(Boolean);
                 var buktiHtml = buktiLinks.length
                     ? buktiLinks.map(function(url, index) {
@@ -1335,7 +1419,11 @@
                     <td>${escapeHTML(p.kelas)}</td>
                     <td><span class="text-primary small">${escapeHTML(p.kategori)}</span><br>${escapeHTML(jenText)}</td>
                     <td><span class="badge ${badgeOrtu}">${escapeHTML(p.status_ortu)}</span></td>
-                    <td><span class="badge ${badgeTindak}">${escapeHTML(p.status_tindak)}</span></td>
+                    <td>
+                        <select class="form-select form-select-sm" style="min-width:175px" aria-label="Edit status tindak lanjut" data-last-status="${currentStatus}" onchange="updateStatusPelanggaranData('${p.id}', this)">
+                            ${statusOptions}
+                        </select>
+                    </td>
                     <td>${buktiHtml}</td>
                     <td class="text-center no-print">
                         <button class="btn btn-sm btn-outline-danger" onclick="hapusDataPelanggaran('${p.id}')"><i class="fas fa-trash"></i></button>
@@ -1343,6 +1431,40 @@
                 </tr>`;
             });
             tbody.innerHTML = rows.join('');
+        };
+
+        window.updateStatusPelanggaranData = function(id, selectEl) {
+            var newStatus = selectEl.value;
+            var previousStatus = selectEl.getAttribute('data-last-status') || 'Belum Ditindaklanjuti';
+            if (newStatus === previousStatus) return;
+
+            selectEl.disabled = true;
+            gasRun('updateStatusPelanggaran', Auth.getToken(), id, newStatus).then(function(res) {
+                selectEl.disabled = false;
+                if(handleSessionExpired(res)) return;
+                if(res.success) {
+                    var item = currentDataPelanggaran.find(function(p) { return String(p.id) === String(id); });
+                    if (item) item.status_tindak = res.status || newStatus;
+                    selectEl.setAttribute('data-last-status', res.status || newStatus);
+                    putClientCache('all-pelanggaran', { success: true, data: currentDataPelanggaran }, CACHE_TTL.short);
+                    invalidateClientCache(['dashboard', 'riwayat:']);
+                    Swal.fire({
+                        toast: true,
+                        position: 'top-end',
+                        icon: 'success',
+                        title: 'Status berhasil diperbarui',
+                        showConfirmButton: false,
+                        timer: 1400
+                    });
+                } else {
+                    selectEl.value = previousStatus;
+                    Swal.fire('Error', res.message || 'Gagal memperbarui status', 'error');
+                }
+            }).catch(function(err) {
+                selectEl.disabled = false;
+                selectEl.value = previousStatus;
+                Swal.fire('Error', (err && err.message) ? err.message : 'Gagal memperbarui status', 'error');
+            });
         };
 
         window.cetakDataPelanggaranPdf = function() {
@@ -1367,7 +1489,10 @@
                     gasRun('deletePelanggaran', Auth.getToken(), id).then(function(res) {
                         showFullPageLoading(false);
                         if(handleSessionExpired(res)) return;
-                        if(res.success) fetchAllData();
+                        if(res.success) {
+                            invalidateClientCache(['dashboard', 'all-pelanggaran', 'ortu:', 'terlambat:', 'riwayat:']);
+                            fetchAllData();
+                        }
                         else Swal.fire('Error', res.message, 'error');
                     });
                 }
@@ -1383,8 +1508,9 @@
 
         window.fetchTerlambatData = function() {
             var bulan = document.getElementById('filterBulanTerlambat').value || currentMonthValue();
-            showSectionLoading(true);
-            gasRun('getTerlambatData', Auth.getToken(), bulan).then(function(res) {
+            var cacheKey = 'terlambat:' + bulan;
+            if (!hasFreshClientCache(cacheKey)) showSectionLoading(true);
+            cachedGasRun(cacheKey, CACHE_TTL.medium, 'getTerlambatData', Auth.getToken(), bulan).then(function(res) {
                 showSectionLoading(false);
                 if(handleSessionExpired(res)) return;
                 if(res.success) renderTerlambat(res.data);
@@ -1430,15 +1556,18 @@
 
         // ==================== TINDAK LANJUT ====================
         window.fetchOrtuData = function(status) {
-            showSectionLoading(true);
-            gasRun('getPanggilanOrtuData', Auth.getToken(), status).then(function(res) {
+            currentOrtuStatus = status;
+            var cacheKey = 'ortu:' + status;
+            if (!hasFreshClientCache(cacheKey)) showSectionLoading(true);
+            cachedGasRun(cacheKey, CACHE_TTL.short, 'getPanggilanOrtuData', Auth.getToken(), status).then(function(res) {
                 showSectionLoading(false);
+                if(activePage !== 'tindaklanjut' || currentOrtuStatus !== status) return;
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
                     var tbody = document.getElementById('tableBodyOrtu');
                     tbody.innerHTML = '';
                     if(res.data.length === 0) {
-                        tbody.innerHTML = `<tr><td colspan="7" class="text-center">Tidak ada data</td></tr>`;
+                        tbody.innerHTML = `<tr><td colspan="8" class="text-center">Tidak ada data</td></tr>`;
                         return;
                     }
                     var rows = res.data.map(function(p) {
@@ -1455,6 +1584,7 @@
                         
                         return `<tr>
                             <td>${safeDate(p.tanggal)}</td>
+                            <td>${safeDate(p.tanggal_panggilan)}</td>
                             <td><strong>${escapeHTML(p.nama_siswa)}</strong></td>
                             <td>${escapeHTML(p.kelas)}</td>
                             <td>${escapeHTML(jenText)}</td>
@@ -1506,6 +1636,7 @@
                 showFullPageLoading(false);
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
+                    invalidateClientCache(['dashboard', 'all-pelanggaran', 'ortu:', 'riwayat:']);
                     bootstrap.Modal.getInstance(document.getElementById('modalOrtu')).hide();
                     Swal.fire('Berhasil', 'Status panggilan orang tua diperbarui', 'success');
                     fetchOrtuData('Belum Dipanggil');
@@ -1517,7 +1648,7 @@
 
         // ==================== RIWAYAT SISWA ====================
         function setupRiwayatPage() {
-            gasRun('getAllSiswaList', Auth.getToken()).then(function(res) {
+            cachedGasRun('all-siswa', CACHE_TTL.reference, 'getAllSiswaList', Auth.getToken()).then(function(res) {
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
                     var sel = document.getElementById('searchRiwayatSiswa');
@@ -1538,9 +1669,11 @@
         window.fetchRiwayatData = function(siswaId) {
             if(!siswaId) { resetRiwayat(); return; }
 
-            showSectionLoading(true);
-            gasRun('getRiwayatSiswaData', Auth.getToken(), siswaId).then(function(res) {
+            var cacheKey = 'riwayat:' + siswaId;
+            if (!hasFreshClientCache(cacheKey)) showSectionLoading(true);
+            cachedGasRun(cacheKey, CACHE_TTL.short, 'getRiwayatSiswaData', Auth.getToken(), siswaId).then(function(res) {
                 showSectionLoading(false);
+                if(document.getElementById('searchRiwayatSiswa').value !== siswaId) return;
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
                     document.getElementById('r_nama').innerText = escapeHTML(res.siswa.nama);
@@ -1573,8 +1706,9 @@
 
         // ==================== MASTER DATA ====================
         function fetchMasterData(type) {
-            showSectionLoading(true);
-            gasRun('getMasterData', Auth.getToken(), type).then(function(res) {
+            var cacheKey = 'master:' + type;
+            if (!hasFreshClientCache(cacheKey)) showSectionLoading(true);
+            cachedGasRun(cacheKey, CACHE_TTL.reference, 'getMasterData', Auth.getToken(), type).then(function(res) {
                 showSectionLoading(false);
                 if(handleSessionExpired(res)) return;
                 if(res.success) {
